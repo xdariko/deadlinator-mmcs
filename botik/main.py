@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import httpx
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -21,8 +22,7 @@ log = logging.getLogger("botik")
 COMMANDS = [
     BotCommand(command="week", description="Дедлайны на неделю"),
     BotCommand(command="check", description="Проверить Moodle прямо сейчас"),
-    BotCommand(command="token", description="Подключить Moodle по токену"),
-    BotCommand(command="instruction", description="Как получить токен"),
+    BotCommand(command="login", description="Войти в Moodle"),
     BotCommand(command="logout", description="Забыть меня"),
     BotCommand(command="help", description="Что я умею"),
 ]
@@ -50,6 +50,8 @@ async def weekly_digest(bot: Bot, syncer: Syncer, store: Storage) -> None:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx на INFO пишет каждый запрос; в логах не должно быть ничего про запросы к Moodle
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     cfg = load_config()
     store = Storage(cfg.db_path, cfg.token_key)
 
@@ -58,6 +60,7 @@ async def main() -> None:
         syncer = Syncer(moodle, store, cfg)
         bot = Bot(
             cfg.bot_token,
+            session=AiohttpSession(proxy=cfg.telegram_proxy),
             default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True),
         )
         dp = Dispatcher(storage=MemoryStorage(), moodle=moodle, store=store, syncer=syncer)

@@ -30,7 +30,16 @@ class Syncer:
             if not user or not user.active:
                 return []
             silent = not user.initialized
-            msgs = await self._sync(user, silent)
+            try:
+                msgs = await self._sync(user, silent)
+            except InvalidToken:
+                # токен протух или отозван — берём новый по сохранённым логину и паролю
+                if not user.password:
+                    raise
+                user.token = await self.moodle.login(user.username, user.password)
+                self.store.set_token(chat_id, user.token)
+                log.info("token renewed for chat %s", chat_id)
+                msgs = await self._sync(user, silent)
             if silent:
                 self.store.set_initialized(chat_id)
             return msgs

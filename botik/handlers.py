@@ -3,13 +3,13 @@ import random
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
 
 from botik import texts
-from botik.moodle import InvalidToken, Moodle, parse_token
+from botik.moodle import InvalidLogin, InvalidToken, Moodle, MoodleError
 from botik.storage import Storage
 from botik.sync import Syncer
 
@@ -20,8 +20,9 @@ router.message.filter(F.chat.type == "private")
 TG_LIMIT = 4000
 
 
-class TokenInput(StatesGroup):
-    waiting = State()
+class LoginInput(StatesGroup):
+    username = State()
+    password = State()
 
 
 async def send(bot: Bot, chat_id: int, text: str) -> None:
@@ -35,12 +36,20 @@ async def send(bot: Bot, chat_id: int, text: str) -> None:
         await bot.send_message(chat_id, chunk)
 
 
+async def delete(message: Message) -> bool:
+    try:
+        await message.delete()
+        return True
+    except TelegramBadRequest:
+        return False
+
+
 async def run_sync(bot: Bot, syncer: Syncer, store: Storage, chat_id: int) -> int:
     try:
         msgs = await syncer.sync(chat_id)
-    except InvalidToken:
+    except (InvalidToken, InvalidLogin):
         store.deactivate(chat_id)
-        await send(bot, chat_id, texts.TOKEN_EXPIRED)
+        await send(bot, chat_id, texts.LOGIN_EXPIRED)
         return 0
     try:
         for m in msgs:
@@ -51,32 +60,28 @@ async def run_sync(bot: Bot, syncer: Syncer, store: Storage, chat_id: int) -> in
     return len(msgs)
 
 
-async def apply_token(
-    message: Message, text: str, bot: Bot, moodle: Moodle, store: Storage, syncer: Syncer
+async def apply_login(
+    message: Message, username: str, password: str,
+    bot: Bot, moodle: Moodle, store: Storage, syncer: Syncer,
 ) -> None:
+    status = await message.answer(texts.LOGIN_CHECKING)
     try:
-        await message.delete()
-    except TelegramBadRequest:
-        pass
-
-    token = parse_token(text)
-    if not token:
-        await message.answer(texts.TOKEN_FORMAT)
-        return
-
-    status = await message.answer(texts.TOKEN_CHECKING)
-    try:
+        token = await moodle.login(username, password)
         info = await moodle.call(token, "core_webservice_get_site_info")
-    except InvalidToken:
-        await status.edit_text(texts.TOKEN_BAD)
+    except InvalidLogin:
+        await status.edit_text(texts.LOGIN_BAD)
+        return
+    except MoodleError as e:
+        log.warning("login refused: %s", e.errorcode)
+        await status.edit_text(texts.LOGIN_REFUSED.format(err=e.errorcode))
         return
     except Exception as e:
-        log.exception("token check failed")
-        await status.edit_text(texts.TOKEN_FAIL.format(err=type(e).__name__))
+        log.exception("login failed")
+        await status.edit_text(texts.LOGIN_FAIL.format(err=type(e).__name__))
         return
 
     chat_id = message.chat.id
-    store.save_user(chat_id, token, info["userid"], info.get("fullname", ""))
+    store.save_user(chat_id, username, password, token, info["userid"], info.get("fullname", ""))
     name = info.get("firstname") or info.get("fullname") or "человек"
     await status.edit_text(texts.SCANNING.format(name=name))
     await run_sync(bot, syncer, store, chat_id)
@@ -95,30 +100,32 @@ async def cmd_start(message: Message):
     await message.answer(texts.START)
 
 
-@router.message(Command("instruction"))
-async def cmd_instruction(message: Message):
-    await message.answer(texts.INSTRUCTION)
+@router.message(Command("login"))
+async def cmd_login(message: Message, state: FSMContext):
+    await state.set_state(LoginInput.username)
+    await message.answer(texts.ASK_USERNAME)
 
 
-@router.message(Command("token"))
-async def cmd_token(
-    message: Message, command: CommandObject, state: FSMContext,
-    bot: Bot, moodle: Moodle, store: Storage, syncer: Syncer,
-):
-    if command.args:
-        await state.clear()
-        await apply_token(message, command.args, bot, moodle, store, syncer)
-        return
-    await state.set_state(TokenInput.waiting)
-    await message.answer(texts.ASK_TOKEN)
+@router.message(LoginInput.username, F.text)
+async def got_username(message: Message, state: FSMContext):
+    username = message.text.strip()
+    await delete(message)
+    await state.update_data(username=username)
+    await state.set_state(LoginInput.password)
+    await message.answer(texts.ASK_PASSWORD)
 
 
-@router.message(TokenInput.waiting, F.text)
-async def got_token(
+@router.message(LoginInput.password, F.text)
+async def got_password(
     message: Message, state: FSMContext, bot: Bot, moodle: Moodle, store: Storage, syncer: Syncer
 ):
+    password = message.text
+    deleted = await delete(message)
+    username = (await state.get_data()).get("username", "")
     await state.clear()
-    await apply_token(message, message.text, bot, moodle, store, syncer)
+    if not deleted:
+        await message.answer(texts.PASSWORD_NOT_DELETED)
+    await apply_login(message, username, password, bot, moodle, store, syncer)
 
 
 @router.message(Command("logout"))
@@ -151,8 +158,10 @@ async def cmd_week(message: Message, bot: Bot, store: Storage, syncer: Syncer):
 
 
 @router.message(F.text)
-async def any_text(message: Message, bot: Bot, moodle: Moodle, store: Storage, syncer: Syncer):
-    if not message.text.startswith("/") and parse_token(message.text):
-        await apply_token(message, message.text, bot, moodle, store, syncer)
+async def any_text(message: Message):
+    # Бот мог перезапуститься посреди входа и забыть, что ждёт пароль, —
+    # тогда пароль прилетит сюда. Не оставляем в чате ничего непонятного.
+    if not message.text.startswith("/") and await delete(message):
+        await message.answer(texts.UNKNOWN_DELETED)
     else:
         await message.answer(texts.UNKNOWN)

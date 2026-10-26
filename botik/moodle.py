@@ -1,12 +1,8 @@
-import base64
-import binascii
-import re
 from typing import Any
-from urllib.parse import unquote
 
 import httpx
 
-TOKEN_RE = re.compile(r"\b[0-9a-f]{32}\b")
+SERVICE = "moodle_mobile_app"
 
 
 class MoodleError(Exception):
@@ -20,21 +16,8 @@ class InvalidToken(MoodleError):
     pass
 
 
-def parse_token(text: str) -> str | None:
-    text = unquote(text.strip())
-    m = re.search(r"token=([A-Za-z0-9+/=_-]+)", text)
-    candidates = [m.group(1)] if m else []
-    candidates.append(text)
-    for raw in candidates:
-        try:
-            decoded = base64.b64decode(raw + "=" * (-len(raw) % 4), validate=True).decode()
-        except (binascii.Error, UnicodeDecodeError, ValueError):
-            continue
-        parts = decoded.split(":::")
-        if len(parts) >= 2 and TOKEN_RE.fullmatch(parts[1]):
-            return parts[1]
-    m = TOKEN_RE.search(text.lower())
-    return m.group(0) if m else None
+class InvalidLogin(MoodleError):
+    pass
 
 
 def _flatten(params: dict, prefix: str = "") -> dict[str, Any]:
@@ -56,6 +39,19 @@ class Moodle:
     def __init__(self, base_url: str, http: httpx.AsyncClient):
         self.base = base_url
         self.http = http
+
+    async def login(self, username: str, password: str) -> str:
+        r = await self.http.post(
+            f"{self.base}/login/token.php",
+            data={"username": username, "password": password, "service": SERVICE},
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("token"):
+            return data["token"]
+        code = data.get("errorcode", "unknown")
+        cls = InvalidLogin if code == "invalidlogin" else MoodleError
+        raise cls(code, data.get("error", ""))
 
     async def call(self, token: str, function: str, **params: Any) -> Any:
         r = await self.http.post(

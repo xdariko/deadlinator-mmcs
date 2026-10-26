@@ -1,11 +1,13 @@
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from cryptography.fernet import Fernet, InvalidToken
 
 PLAIN_TOKEN_RE = re.compile(r"[0-9a-f]{32}")
 
+# Шифруется всё, что говорит о человеке: логин, пароль, токен, имя, оценки,
+# названия курсов и заданий. В открытом виде остаются только id и даты.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     chat_id       INTEGER PRIMARY KEY,
@@ -13,7 +15,9 @@ CREATE TABLE IF NOT EXISTS users (
     moodle_userid INTEGER NOT NULL,
     fullname      TEXT,
     initialized   INTEGER NOT NULL DEFAULT 0,
-    active        INTEGER NOT NULL DEFAULT 1
+    active        INTEGER NOT NULL DEFAULT 1,
+    username      TEXT,
+    password      TEXT
 );
 CREATE TABLE IF NOT EXISTS state (
     chat_id INTEGER NOT NULL,
@@ -35,16 +39,19 @@ CREATE TABLE IF NOT EXISTS assignments (
     PRIMARY KEY (chat_id, assign_id)
 );
 """
+SCHEMA_VERSION = 1
 
 
 @dataclass
 class User:
     chat_id: int
-    token: str
+    token: str = field(repr=False)
     moodle_userid: int
-    fullname: str
+    fullname: str = field(repr=False)
     initialized: bool
     active: bool
+    username: str | None = field(repr=False)
+    password: str | None = field(repr=False)
 
 
 @dataclass
@@ -60,43 +67,64 @@ class Assignment:
 
 
 class Storage:
-    def __init__(self, path: str, token_key: str):
-        self.fernet = Fernet(token_key)
+    def __init__(self, path: str, key: str):
+        self.fernet = Fernet(key)
         self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.execute("PRAGMA secure_delete = ON")
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
-        self._encrypt_plain_tokens()
+        self._migrate()
         self._check_key()
 
-    def _encrypt_plain_tokens(self) -> None:
-        rows = self.db.execute("SELECT chat_id, token FROM users").fetchall()
+    def _migrate(self) -> None:
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version >= SCHEMA_VERSION:
+            return
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(users)")}
         with self.db:
-            for r in rows:
-                if PLAIN_TOKEN_RE.fullmatch(r["token"]):
-                    self.db.execute(
-                        "UPDATE users SET token = ? WHERE chat_id = ?",
-                        (self._encrypt(r["token"]), r["chat_id"]),
-                    )
+            for col in ("username", "password"):
+                if col not in cols:
+                    self.db.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+            for r in self.db.execute("SELECT chat_id, token, fullname FROM users").fetchall():
+                token = r["token"]
+                if PLAIN_TOKEN_RE.fullmatch(token):
+                    token = self._enc(token)
+                self.db.execute(
+                    "UPDATE users SET token = ?, fullname = ? WHERE chat_id = ?",
+                    (token, self._enc(r["fullname"]), r["chat_id"]),
+                )
+            for r in self.db.execute("SELECT rowid, value FROM state").fetchall():
+                self.db.execute(
+                    "UPDATE state SET value = ? WHERE rowid = ?", (self._enc(r["value"]), r["rowid"])
+                )
+            for r in self.db.execute("SELECT rowid, course, name, url FROM assignments").fetchall():
+                self.db.execute(
+                    "UPDATE assignments SET course = ?, name = ?, url = ? WHERE rowid = ?",
+                    (self._enc(r["course"]), self._enc(r["name"]), self._enc(r["url"]), r["rowid"]),
+                )
+            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        self.db.execute("VACUUM")
 
     def _check_key(self) -> None:
         row = self.db.execute("SELECT token FROM users LIMIT 1").fetchone()
         if row:
             try:
-                self._decrypt(row["token"])
+                self._dec(row["token"])
             except InvalidToken:
-                raise SystemExit("TOKEN_KEY не подходит к базе: токены зашифрованы другим ключом")
+                raise SystemExit("TOKEN_KEY не подходит к базе: данные зашифрованы другим ключом")
 
-    def _encrypt(self, token: str) -> str:
-        return self.fernet.encrypt(token.encode()).decode()
+    def _enc(self, value: str | None) -> str | None:
+        return None if value is None else self.fernet.encrypt(value.encode()).decode()
 
-    def _decrypt(self, token: str) -> str:
-        return self.fernet.decrypt(token.encode()).decode()
+    def _dec(self, value: str | None) -> str | None:
+        return None if value is None else self.fernet.decrypt(value.encode()).decode()
 
     def _user(self, row: sqlite3.Row) -> User:
         return User(
-            chat_id=row["chat_id"], token=self._decrypt(row["token"]),
-            moodle_userid=row["moodle_userid"], fullname=row["fullname"] or "",
+            chat_id=row["chat_id"], token=self._dec(row["token"]),
+            moodle_userid=row["moodle_userid"], fullname=self._dec(row["fullname"]) or "",
             initialized=bool(row["initialized"]), active=bool(row["active"]),
+            username=self._dec(row["username"]), password=self._dec(row["password"]),
         )
 
     def get_user(self, chat_id: int) -> User | None:
@@ -107,19 +135,28 @@ class Storage:
         rows = self.db.execute("SELECT * FROM users WHERE active = 1").fetchall()
         return [self._user(r) for r in rows]
 
-    def save_user(self, chat_id: int, token: str, moodle_userid: int, fullname: str) -> None:
+    def save_user(
+        self, chat_id: int, username: str, password: str, token: str, moodle_userid: int, fullname: str
+    ) -> None:
         old = self.get_user(chat_id)
         with self.db:
             if old and old.moodle_userid != moodle_userid:
                 self._wipe(chat_id)
             self.db.execute(
-                """INSERT INTO users (chat_id, token, moodle_userid, fullname, initialized, active)
-                   VALUES (?, ?, ?, ?, 0, 1)
+                """INSERT INTO users
+                     (chat_id, token, moodle_userid, fullname, initialized, active, username, password)
+                   VALUES (?, ?, ?, ?, 0, 1, ?, ?)
                    ON CONFLICT (chat_id) DO UPDATE SET
                      token = excluded.token, moodle_userid = excluded.moodle_userid,
-                     fullname = excluded.fullname, active = 1""",
-                (chat_id, self._encrypt(token), moodle_userid, fullname),
+                     fullname = excluded.fullname, active = 1,
+                     username = excluded.username, password = excluded.password""",
+                (chat_id, self._enc(token), moodle_userid, self._enc(fullname),
+                 self._enc(username), self._enc(password)),
             )
+
+    def set_token(self, chat_id: int, token: str) -> None:
+        with self.db:
+            self.db.execute("UPDATE users SET token = ? WHERE chat_id = ?", (self._enc(token), chat_id))
 
     def set_initialized(self, chat_id: int) -> None:
         with self.db:
@@ -133,6 +170,7 @@ class Storage:
         with self.db:
             self._wipe(chat_id)
             self.db.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
+        self.db.execute("VACUUM")
 
     def _wipe(self, chat_id: int) -> None:
         self.db.execute("DELETE FROM state WHERE chat_id = ?", (chat_id,))
@@ -142,13 +180,13 @@ class Storage:
         rows = self.db.execute(
             "SELECT key, value FROM state WHERE chat_id = ? AND kind = ?", (chat_id, kind)
         ).fetchall()
-        return {r["key"]: r["value"] for r in rows}
+        return {r["key"]: self._dec(r["value"]) for r in rows}
 
     def set_state(self, chat_id: int, kind: str, key: str, value: str = "1") -> None:
         with self.db:
             self.db.execute(
                 "INSERT OR REPLACE INTO state (chat_id, kind, key, value) VALUES (?, ?, ?, ?)",
-                (chat_id, kind, key, value),
+                (chat_id, kind, key, self._enc(value)),
             )
 
     def del_state(self, chat_id: int, kind: str, key: str) -> None:
@@ -163,8 +201,8 @@ class Storage:
             self.db.executemany(
                 "INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
-                    (chat_id, a.id, a.course, a.name, a.url, a.opens, a.due, a.cutoff,
-                     None if a.done is None else int(a.done))
+                    (chat_id, a.id, self._enc(a.course), self._enc(a.name), self._enc(a.url),
+                     a.opens, a.due, a.cutoff, None if a.done is None else int(a.done))
                     for a in items
                 ],
             )
@@ -173,8 +211,8 @@ class Storage:
         rows = self.db.execute("SELECT * FROM assignments WHERE chat_id = ?", (chat_id,)).fetchall()
         return [
             Assignment(
-                id=r["assign_id"], course=r["course"], name=r["name"], url=r["url"],
-                opens=r["opens"], due=r["due"], cutoff=r["cutoff"],
+                id=r["assign_id"], course=self._dec(r["course"]), name=self._dec(r["name"]),
+                url=self._dec(r["url"]), opens=r["opens"], due=r["due"], cutoff=r["cutoff"],
                 done=None if r["done"] is None else bool(r["done"]),
             )
             for r in rows
