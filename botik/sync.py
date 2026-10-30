@@ -30,19 +30,66 @@ class Syncer:
             if not user or not user.active:
                 return []
             silent = not user.initialized
-            try:
-                msgs = await self._sync(user, silent)
-            except InvalidToken:
-                # токен протух или отозван — берём новый по сохранённым логину и паролю
-                if not user.password:
-                    raise
-                user.token = await self.moodle.login(user.username, user.password)
-                self.store.set_token(chat_id, user.token)
-                log.info("token renewed for chat %s", chat_id)
-                msgs = await self._sync(user, silent)
+            msgs = await self._authed(user, lambda: self._sync(user, silent))
             if silent:
                 self.store.set_initialized(chat_id)
+            self.store.set_synced(chat_id, int(time.time()))
             return msgs
+
+    async def morning(self, chat_id: int) -> list[str]:
+        """Утреннее «сегодня дедлайн». Берёт задания из базы и у Moodle спрашивает
+        только статус сдачи этих нескольких заданий, а не делает полную проверку."""
+        async with self._locks[chat_id]:
+            user = self.store.get_user(chat_id)
+            if not user or not user.active or not user.initialized:
+                return []
+            now = int(time.time())
+            due = self._due_today(chat_id, self.store.assignments(chat_id), now)
+            if not due:
+                return []
+
+            async def refresh() -> None:
+                for a in due:
+                    done = await self._is_done(user.token, a.id)
+                    if done is not None:
+                        a.done = done
+                        self.store.set_done(chat_id, a.id, done)
+
+            await self._authed(user, refresh)
+            due = [a for a in due if a.done is not True]
+            return [self._mark_today(chat_id, due, now)] if due else []
+
+    def cooldown_left(self, user: User) -> int:
+        return user.last_sync + self.cfg.check_cooldown_hours * 3600 - int(time.time())
+
+    async def _authed(self, user: User, run):
+        try:
+            return await run()
+        except InvalidToken:
+            # токен протух или отозван — берём новый по сохранённым логину и паролю
+            if not user.password:
+                raise
+            user.token = await self.moodle.login(user.username, user.password)
+            self.store.set_token(user.chat_id, user.token)
+            log.info("token renewed for chat %s", user.chat_id)
+            return await run()
+
+    def _due_today(self, chat: int, items: list[Assignment], now: int) -> list[Assignment]:
+        tz = self.cfg.tz
+        today = datetime.now(tz).date()
+        seen = self.store.get_state(chat, "today")
+        return [
+            a for a in items
+            if a.done is not True and a.opens <= now and a.due > now
+            and datetime.fromtimestamp(a.due, tz).date() == today
+            and f"{a.id}:{today}" not in seen
+        ]
+
+    def _mark_today(self, chat: int, items: list[Assignment], now: int) -> str:
+        today = datetime.now(self.cfg.tz).date()
+        for a in items:
+            self.store.set_state(chat, "today", f"{a.id}:{today}")
+        return texts.due_today(sorted(items, key=lambda a: a.due), now, self.cfg.tz)
 
     def digest(self, chat_id: int, weekly: bool) -> str:
         now = int(time.time())
@@ -199,20 +246,12 @@ class Syncer:
         if overdue and not silent:
             out.append(texts.overdue(sorted(overdue, key=lambda a: a.due), now, tz))
 
-        local = datetime.now(tz)
-        if local.hour >= self.cfg.remind_hour:
-            today = local.date()
-            today_seen = s.get_state(chat, "today")
-            due_today = [
-                a for a in items
-                if a.done is not True and a.opens <= now and a.due > now
-                and datetime.fromtimestamp(a.due, tz).date() == today
-                and f"{a.id}:{today}" not in today_seen
-            ]
-            for a in due_today:
-                s.set_state(chat, "today", f"{a.id}:{today}")
+        # основное напоминание шлёт morning() в REMIND_HOUR; здесь — только то,
+        # что появилось или стало известно позже
+        if datetime.now(tz).hour >= self.cfg.remind_hour:
+            due_today = self._due_today(chat, items, now)
             if due_today:
-                out.append(texts.due_today(sorted(due_today, key=lambda a: a.due), now, tz))
+                out.append(self._mark_today(chat, due_today, now))
 
         return out
 

@@ -1,5 +1,6 @@
 import logging
 import random
+from collections.abc import Awaitable
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -45,8 +46,12 @@ async def delete(message: Message) -> bool:
 
 
 async def run_sync(bot: Bot, syncer: Syncer, store: Storage, chat_id: int) -> int:
+    return await deliver(bot, store, chat_id, syncer.sync(chat_id))
+
+
+async def deliver(bot: Bot, store: Storage, chat_id: int, job: Awaitable[list[str]]) -> int:
     try:
-        msgs = await syncer.sync(chat_id)
+        msgs = await job
     except (InvalidToken, InvalidLogin):
         store.deactivate(chat_id)
         await send(bot, chat_id, texts.LOGIN_EXPIRED)
@@ -140,6 +145,10 @@ async def cmd_check(message: Message, bot: Bot, store: Storage, syncer: Syncer):
     if not user or not user.active:
         await message.answer(texts.NEED_LOGIN)
         return
+    left = syncer.cooldown_left(user)
+    if left > 0:
+        await message.answer(texts.check_cooldown(user.last_sync, user.last_sync + left, syncer.cfg.tz))
+        return
     await message.answer(random.choice(texts.CHECKING))
     if await run_sync(bot, syncer, store, message.chat.id) == 0 and store.get_user(message.chat.id).active:
         await message.answer(random.choice(texts.NOTHING_NEW))
@@ -151,10 +160,16 @@ async def cmd_week(message: Message, bot: Bot, store: Storage, syncer: Syncer):
     if not user or not user.active:
         await message.answer(texts.NEED_LOGIN)
         return
-    await message.answer(random.choice(texts.CHECKING))
-    await run_sync(bot, syncer, store, message.chat.id)
+    # недавно проверяли — отвечаем из базы, Moodle не трогаем
+    cached = syncer.cooldown_left(user) > 0
+    if not cached:
+        await message.answer(random.choice(texts.CHECKING))
+        await run_sync(bot, syncer, store, message.chat.id)
     if store.get_user(message.chat.id).active:
-        await send(bot, message.chat.id, syncer.digest(message.chat.id, weekly=False))
+        text = syncer.digest(message.chat.id, weekly=False)
+        if cached:
+            text += texts.as_of(user.last_sync, syncer.cfg.tz)
+        await send(bot, message.chat.id, text)
 
 
 @router.message(F.text)

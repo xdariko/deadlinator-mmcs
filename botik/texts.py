@@ -52,12 +52,25 @@ NOTHING_NEW = [
 CHECKING = ["🤖 Запускаю сканирование…", "🤖 Анализирую Moodle. Не двигайся."]
 
 
+def check_cooldown(last: int, next_at: int, tz: ZoneInfo) -> str:
+    return (
+        f"🤖 Я уже сканировал Moodle в {fmt_time(last, tz)}. Перегреваться нельзя.\n"
+        f"Ручная проверка снова доступна в {fmt_time(next_at, tz)}, "
+        "а о новом я и сам доложу, когда найду.\n"
+        "Цели на неделю: /week"
+    )
+
+
+def as_of(ts: int, tz: ZoneInfo) -> str:
+    return f"\n\n<i>🤖 Данные на {fmt_time(ts, tz)}</i>"
+
+
 def ready(courses: int) -> str:
     return (
         f"🤖 Сканирование завершено. Обнаружено {courses} "
         f"{plural(courses, 'курс', 'курса', 'курсов')}.\n"
         "Всё, что уже есть, — старые цели. Докладываю только о новом. "
-        "Сканирую раз в час. I'll be back.\n"
+        "Сканирую несколько раз в день, про сегодняшние дедлайны напомню утром. I'll be back.\n"
         "Как удалить мои данные — /logout\n"
         "Цели на неделю: /week"
     )
@@ -74,6 +87,11 @@ def plural(n: int, one: str, few: str, many: str) -> str:
 def fmt_dt(ts: int, tz: ZoneInfo) -> str:
     d = datetime.fromtimestamp(ts, tz)
     return f"{WEEKDAYS[d.weekday()]} {d:%d.%m %H:%M}"
+
+
+def fmt_time(ts: int, tz: ZoneInfo) -> str:
+    d = datetime.fromtimestamp(ts, tz)
+    return f"{d:%H:%M}" if d.date() == datetime.now(tz).date() else fmt_dt(ts, tz)
 
 
 def fmt_left(sec: int) -> str:

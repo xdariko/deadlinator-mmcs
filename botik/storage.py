@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS users (
     initialized   INTEGER NOT NULL DEFAULT 0,
     active        INTEGER NOT NULL DEFAULT 1,
     username      TEXT,
-    password      TEXT
+    password      TEXT,
+    last_sync     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS state (
     chat_id INTEGER NOT NULL,
@@ -39,7 +40,7 @@ CREATE TABLE IF NOT EXISTS assignments (
     PRIMARY KEY (chat_id, assign_id)
 );
 """
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -52,6 +53,7 @@ class User:
     active: bool
     username: str | None = field(repr=False)
     password: str | None = field(repr=False)
+    last_sync: int
 
 
 @dataclass
@@ -71,6 +73,9 @@ class Storage:
         self.fernet = Fernet(key)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("PRAGMA secure_delete = ON")
+        # WAL + NORMAL: запись не дёргает диск на каждый коммит, а их за проверку сотни
+        self.db.execute("PRAGMA journal_mode = WAL")
+        self.db.execute("PRAGMA synchronous = NORMAL")
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         self._migrate()
@@ -81,7 +86,15 @@ class Storage:
         if version >= SCHEMA_VERSION:
             return
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(users)")}
+        if version >= 1:
+            with self.db:
+                if "last_sync" not in cols:
+                    self.db.execute("ALTER TABLE users ADD COLUMN last_sync INTEGER NOT NULL DEFAULT 0")
+                self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            return
         with self.db:
+            if "last_sync" not in cols:
+                self.db.execute("ALTER TABLE users ADD COLUMN last_sync INTEGER NOT NULL DEFAULT 0")
             for col in ("username", "password"):
                 if col not in cols:
                     self.db.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
@@ -125,6 +138,7 @@ class Storage:
             moodle_userid=row["moodle_userid"], fullname=self._dec(row["fullname"]) or "",
             initialized=bool(row["initialized"]), active=bool(row["active"]),
             username=self._dec(row["username"]), password=self._dec(row["password"]),
+            last_sync=row["last_sync"],
         )
 
     def get_user(self, chat_id: int) -> User | None:
@@ -134,6 +148,27 @@ class Storage:
     def active_users(self) -> list[User]:
         rows = self.db.execute("SELECT * FROM users WHERE active = 1").fetchall()
         return [self._user(r) for r in rows]
+
+    def count_active(self) -> int:
+        return self.db.execute("SELECT count(*) FROM users WHERE active = 1").fetchone()[0]
+
+    def due_users(self, synced_before: int, limit: int) -> list[int]:
+        rows = self.db.execute(
+            "SELECT chat_id FROM users WHERE active = 1 AND last_sync <= ? ORDER BY last_sync LIMIT ?",
+            (synced_before, limit),
+        ).fetchall()
+        return [r["chat_id"] for r in rows]
+
+    def set_synced(self, chat_id: int, ts: int) -> None:
+        with self.db:
+            self.db.execute("UPDATE users SET last_sync = ? WHERE chat_id = ?", (ts, chat_id))
+
+    def set_done(self, chat_id: int, assign_id: int, done: bool) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE assignments SET done = ? WHERE chat_id = ? AND assign_id = ?",
+                (int(done), chat_id, assign_id),
+            )
 
     def save_user(
         self, chat_id: int, username: str, password: str, token: str, moodle_userid: int, fullname: str

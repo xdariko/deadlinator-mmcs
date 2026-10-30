@@ -12,7 +12,8 @@ class Config:
     moodle_url: str
     db_path: str
     tz: ZoneInfo
-    poll_minutes: int
+    poll_hours: int
+    check_cooldown_hours: int
     digest_day: str
     digest_hour: int
     remind_hour: int
@@ -39,7 +40,8 @@ def load_config() -> Config:
         moodle_url=moodle_url,
         db_path=os.getenv("DB_PATH", "botik.sqlite3"),
         tz=ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow")),
-        poll_minutes=int(os.getenv("POLL_MINUTES", "60")),
+        poll_hours=max(1, int(os.getenv("POLL_HOURS", "6"))),
+        check_cooldown_hours=int(os.getenv("CHECK_COOLDOWN_HOURS", "3")),
         digest_day=os.getenv("DIGEST_DAY", "mon"),
         digest_hour=int(os.getenv("DIGEST_HOUR", "9")),
         remind_hour=int(os.getenv("REMIND_HOUR", "9")),
