@@ -31,7 +31,7 @@ def load_config() -> Config:
             "TOKEN_KEY не задан. Сгенерируй и впиши в .env:\n"
             '  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
         )
-    moodle_url = os.getenv("MOODLE_URL", "https://edu.mmcs.sfedu.ru").rstrip("/")
+    moodle_url = os.getenv("MOODLE_URL", "https://edu-mmcs.sfedu.ru").rstrip("/")
     if not moodle_url.startswith("https://"):
         raise SystemExit("MOODLE_URL должен начинаться с https:// — иначе пароли пойдут открытым текстом")
     return Config(

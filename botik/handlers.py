@@ -49,6 +49,15 @@ async def run_sync(bot: Bot, syncer: Syncer, store: Storage, chat_id: int) -> in
     return await deliver(bot, store, chat_id, syncer.sync(chat_id))
 
 
+async def user_sync(bot: Bot, syncer: Syncer, store: Storage, chat_id: int) -> int | None:
+    try:
+        return await run_sync(bot, syncer, store, chat_id)
+    except Exception:
+        log.exception("sync on command failed for chat %s", chat_id)
+        await send(bot, chat_id, texts.MOODLE_DOWN)
+        return None
+
+
 async def deliver(bot: Bot, store: Storage, chat_id: int, job: Awaitable[list[str]]) -> int:
     try:
         msgs = await job
@@ -89,7 +98,8 @@ async def apply_login(
     store.save_user(chat_id, username, password, token, info["userid"], info.get("fullname", ""))
     name = info.get("firstname") or info.get("fullname") or "человек"
     await status.edit_text(texts.SCANNING.format(name=name))
-    await run_sync(bot, syncer, store, chat_id)
+    if await user_sync(bot, syncer, store, chat_id) is None:
+        return
     await message.answer(texts.ready(len(store.get_state(chat_id, "course"))))
 
 
@@ -150,7 +160,7 @@ async def cmd_check(message: Message, bot: Bot, store: Storage, syncer: Syncer):
         await message.answer(texts.check_cooldown(user.last_sync, user.last_sync + left, syncer.cfg.tz))
         return
     await message.answer(random.choice(texts.CHECKING))
-    if await run_sync(bot, syncer, store, message.chat.id) == 0 and store.get_user(message.chat.id).active:
+    if await user_sync(bot, syncer, store, message.chat.id) == 0 and store.get_user(message.chat.id).active:
         await message.answer(random.choice(texts.NOTHING_NEW))
 
 
@@ -164,10 +174,10 @@ async def cmd_week(message: Message, bot: Bot, store: Storage, syncer: Syncer):
     cached = syncer.cooldown_left(user) > 0
     if not cached:
         await message.answer(random.choice(texts.CHECKING))
-        await run_sync(bot, syncer, store, message.chat.id)
+        cached = await user_sync(bot, syncer, store, message.chat.id) is None
     if store.get_user(message.chat.id).active:
         text = syncer.digest(message.chat.id, weekly=False)
-        if cached:
+        if cached and user.last_sync:
             text += texts.as_of(user.last_sync, syncer.cfg.tz)
         await send(bot, message.chat.id, text)
 
